@@ -1,4 +1,5 @@
 language: rust
+rust: nightly
 
 matrix:
   include:
@@ -11,40 +12,21 @@ matrix:
     - env: TARGET_BUILD=x86_64-unknown-linux-gnu
       rust: nightly
 
-before_install:
-  - set -e
-  - rustup self update
-  - sudo apt-get update -qq
-
 install:
-  - rustup override set nightly
-  - rustup component add rust-src
-  - rustup target add arm-unknown-linux-gnueabi
-  - rustup target add armv7-unknown-linux-gnueabihf
-  - rustup target add thumbv7em-none-eabihf
-  - rustup target add thumbv7em-none-eabi
-  - rustup target add thumbv6m-none-eabi
-  - rustup target add thumbv7m-none-eabi
-  - source ~/.cargo/env || true
+  - rustup component add rustfmt-preview
+  - rustup target add $TARGET_BUILD || true
 
 script:
-  - cargo build --target $TARGET_BUILD
-  - cargo build --target $TARGET_BUILD --release
-  - cargo check
+  - cargo fmt --all -- --check
+  - cargo check --target $TARGET_BUILD
 
 after_script: set +e
 
 cache:
   cargo: true
-  directories:
-    - $HOME/.xargo
 
 before_cache:
-  # Travis can't cache files that are not readable by "others"
   - chmod -R a+r $HOME/.cargo
-
-#after_success:
-#  - bash ci/after_success.sh
 
 notifications:
   email:
