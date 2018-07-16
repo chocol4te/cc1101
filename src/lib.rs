@@ -13,13 +13,17 @@ const FXOSC: u64 = 26_000_000;
 
 #[macro_use]
 mod macros;
-mod config;
-mod status;
+pub mod config;
+mod rssi;
+pub mod status;
 mod traits;
+
+use rssi::rssi_to_dbm;
 
 #[derive(Debug)]
 pub enum Error<E> {
     RxOverflow,
+    CrcMismatch,
     Spi(E),
 }
 
@@ -45,11 +49,49 @@ where
         Ok(Self { spi, cs })
     }
 
+    pub fn reset(&mut self) -> Result<(), Error<E>> {
+        self.cs.set_low();
+        self.cs.set_high();
+        self.write_strobe(Command::SRES)?;
+        Ok(())
+    }
+
     pub fn set_frequency(&mut self, hz: u64) -> Result<(), Error<E>> {
         let freq = hz * 1_u64.rotate_left(16) / FXOSC;
         self.write_register(config::Register::FREQ2, ((freq >> 16) & 0xff) as u8)?;
         self.write_register(config::Register::FREQ1, ((freq >> 8) & 0xff) as u8)?;
         self.write_register(config::Register::FREQ0, (freq & 0xff) as u8)?;
+
+        match hz {
+            315_000_000 => self.write_burst(Command::PATABLE, &mut PATABLE_POWER_315)?,
+            433_000_000 => self.write_burst(Command::PATABLE, &mut PATABLE_POWER_433)?,
+            868_000_000 => self.write_burst(Command::PATABLE, &mut PATABLE_POWER_868)?,
+            915_000_000 => self.write_burst(Command::PATABLE, &mut PATABLE_POWER_915)?,
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    pub fn set_power_level(&mut self, dbm: i32) -> Result<(), Error<E>> {
+        let pa: u8 = match dbm {
+            pa if pa <= -30 => 0x00,
+            pa if pa <= -20 => 0x01,
+            pa if pa <= -15 => 0x02,
+            pa if pa <= -10 => 0x03,
+            pa if pa <= 0 => 0x04,
+            pa if pa <= 5 => 0x05,
+            pa if pa <= 7 => 0x06,
+            pa if pa > 7 => 0x07,
+            _ => 0xC0,
+        };
+
+        self.write_register(config::Register::FREND0, pa)?;
+        Ok(())
+    }
+
+    pub fn set_channel(&mut self, channel: u8) -> Result<(), Error<E>> {
+        self.write_register(config::Register::CHANNR, channel)?;
         Ok(())
     }
 
@@ -60,10 +102,31 @@ where
         Ok((partnum, version))
     }
 
+    pub fn get_rssi_dbm(&mut self) -> Result<i16, Error<E>> {
+        Ok(rssi_to_dbm(self.read_status(status::Register::RSSI)?))
+    }
+
+    pub fn get_lqi(&mut self) -> Result<u8, Error<E>> {
+        let lqi = self.read_status(status::Register::LQI)?;
+        Ok(lqi & !(1u8 << 7))
+    }
+
+    pub fn get_config(&mut self) -> Result<[u8; 48], Error<E>> {
+        let mut buf: [u8; 48] = [0; 48];
+
+        buf[0] = Access::READ_BURST.offset();
+
+        self.cs.set_low();
+        self.spi.transfer(&mut buf)?;
+        self.cs.set_high();
+        Ok(buf)
+    }
+
     pub fn set_sync_mode(&mut self, sync_mode: SyncMode) -> Result<(), Error<E>> {
         use config::*;
 
-        let reset: u16 = (u16::from(SYNC1::default().bits())) << 8 | (u16::from(SYNC1::default().bits()));
+        let reset: u16 =
+            (u16::from(SYNC1::default().bits())) << 8 | (u16::from(SYNC1::default().bits()));
 
         let (mode, word) = match sync_mode {
             SyncMode::Disabled => (SyncCheck::DISABLED, reset),
@@ -126,7 +189,7 @@ where
             RadioMode::Transmit => {
                 self.set_radio_mode(RadioMode::Idle)?;
                 self.write_strobe(Command::STX)?;
-                MachineState::TX
+                MachineState::IDLE
             }
             RadioMode::Idle => {
                 self.write_strobe(Command::SIDLE)?;
@@ -215,17 +278,37 @@ where
     // Should also be able to configure MCSM1.RXOFF_MODE to declare what state
     // to enter after fully receiving a packet.
     // Possible targets: IDLE, FSTON, TX, RX
-    pub fn receive(&mut self, buf: &mut [u8], rssi: &mut u8, lqi: &mut u8) -> Result<(), Error<E>> {
+    pub fn receive(&mut self, addr: &mut u8, buf: &mut [u8]) -> Result<u8, Error<E>> {
         use status::*;
 
-        self.rx_bytes_available()?;
+        match self.rx_bytes_available() {
+            Ok(_nbytes) => {
+                let mut length = 0u8;
+                self.read_fifo(addr, &mut length, buf)?;
+                let lqi = self.read_status(Register::LQI)?;
+                self.await_machine_state(MachineState::IDLE)?;
+                self.write_strobe(Command::SFRX)?;
+                if (lqi >> 7) != 1 {
+                    Err(Error::CrcMismatch)
+                } else {
+                    Ok(length)
+                }
+            }
+            Err(err) => {
+                self.write_strobe(Command::SFRX)?;
+                Err(err)
+            }
+        }
+    }
 
-        self.read_burst(Command::FIFO, buf)?;
+    // Unsure of address functionality, should it be included?
+    pub fn transmit(&mut self, buf: &mut [u8]) -> Result<(), Error<E>> {
+        self.write_burst(Command::FIFO, &mut [buf.len() as u8])?;
+        self.write_burst(Command::FIFO, buf)?;
 
-        *rssi = self.read_status(Register::RSSI)?;
-        *lqi = self.read_status(Register::LQI)?;
+        self.set_radio_mode(RadioMode::Transmit)?;
 
-        self.write_strobe(Command::SFRX)?;
+        self.set_radio_mode(RadioMode::Receive)?;
 
         Ok(())
     }
@@ -241,7 +324,7 @@ where
         Ok(buffer[1])
     }
 
-    fn read_status(&mut self, reg: status::Register) -> Result<u8, Error<E>> {
+    pub fn read_status(&mut self, reg: status::Register) -> Result<u8, Error<E>> {
         self.cs.set_low();
 
         let mut buffer = [reg.addr() | Access::READ_SINGLE.offset(), 0];
@@ -252,15 +335,26 @@ where
         Ok(buffer[1])
     }
 
-    fn read_burst(&mut self, com: Command, buf: &mut [u8]) -> Result<(), Error<E>> {
+    pub fn read_fifo(
+        &mut self,
+        addr: &mut u8,
+        len: &mut u8,
+        buf: &mut [u8],
+    ) -> Result<(), Error<E>> {
+        let mut buffer = [Command::FIFO.addr() | Access::READ_BURST.offset(), 0, 0];
+
         self.cs.set_low();
-        buf[0] = com.addr() | Access::READ_BURST.offset();
+        self.spi.transfer(&mut buffer)?;
         self.spi.transfer(buf)?;
         self.cs.set_high();
+
+        *len = buffer[1];
+        *addr = buffer[2];
+
         Ok(())
     }
 
-    fn write_strobe(&mut self, com: Command) -> Result<(), Error<E>> {
+    pub fn write_strobe(&mut self, com: Command) -> Result<(), Error<E>> {
         self.cs.set_low();
         self.spi.write(&[com.addr()])?;
         self.cs.set_high();
@@ -278,6 +372,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn write_burst(&mut self, com: Command, buf: &mut [u8]) -> Result<(), Error<E>> {
         self.cs.set_low();
 
@@ -299,6 +394,21 @@ where
         self.write_register(reg, f(r))?;
         Ok(())
     }
+
+    pub fn preset_msk_500kb(&mut self) -> Result<(), Error<E>> {
+        let mut config = [
+            0x40, // WRITE BURST
+            0x07, 0x2E, 0x80, 0x07, 0x57, 0x43, 0x3E, 0x0E, 0x45, 0x01, 0x01, 0x0C, 0x00, 0x23,
+            0x31, 0x3B, 0x0E, 0x3B, 0x73, 0xA0, 0xF8, 0x00, 0x07, 0x0C, 0x18, 0x1D, 0x1C, 0xC7,
+            0x40, 0xB2, 0x02, 0x26, 0x09, 0xB6, 0x04, 0xEF, 0x2B, 0x2E, 0x19, 0x51, 0x00, 0x59,
+            0x7F, 0x3C, 0x81, 0x3F, 0x0B,
+        ];
+
+        self.cs.set_low();
+        self.spi.write(&mut config)?;
+        self.cs.set_high();
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]
@@ -316,8 +426,8 @@ enum Access {
 }
 
 impl Access {
-    fn offset(&self) -> u8 {
-        *self as u8
+    fn offset(self) -> u8 {
+        self as u8
     }
 }
 
@@ -330,7 +440,7 @@ impl Command {
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy)]
-enum Command {
+pub enum Command {
     /* STROBE COMMANDS */
     SRES = 0x30,    // Reset chip
     SFSTXON = 0x31, // Enable/calibrate freq synthesizer
@@ -384,8 +494,8 @@ pub enum RadioMode {
 }
 
 impl MachineState {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -475,9 +585,10 @@ enum GdoCfg {
     CLK_XOSC_192 = 0x3F,
 }
 
+#[allow(dead_code)]
 impl GdoCfg {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -503,9 +614,10 @@ enum FifoThreshold {
     TX_1_RX_64 = 0x0F,
 }
 
+#[allow(dead_code)]
 impl FifoThreshold {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -520,8 +632,8 @@ enum AddressCheck {
 }
 
 impl AddressCheck {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -535,8 +647,8 @@ enum LengthConfig {
 }
 
 impl LengthConfig {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -562,8 +674,8 @@ enum SyncCheck {
 }
 
 impl SyncCheck {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -583,8 +695,8 @@ enum NumPreamble {
 
 #[allow(dead_code)]
 impl NumPreamble {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -599,8 +711,8 @@ enum AutoCalibration {
 }
 
 impl AutoCalibration {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
 
@@ -614,8 +726,14 @@ enum PoTimeout {
     EXPIRE_COUNT_256 = 0x03,
 }
 
+#[allow(dead_code)]
 impl PoTimeout {
-    fn value(&self) -> u8 {
-        *self as u8
+    fn value(self) -> u8 {
+        self as u8
     }
 }
+
+const PATABLE_POWER_315: [u8; 8] = [0x12, 0x0D, 0x1C, 0x34, 0x51, 0x85, 0xCB, 0xC2];
+const PATABLE_POWER_433: [u8; 8] = [0x12, 0x0E, 0x1D, 0x34, 0x60, 0x84, 0xC8, 0xC0];
+const PATABLE_POWER_868: [u8; 8] = [0x03, 0x0F, 0x1E, 0x27, 0x50, 0x81, 0xCB, 0xC2];
+const PATABLE_POWER_915: [u8; 8] = [0x03, 0x0E, 0x1E, 0x27, 0x8E, 0xCD, 0xC7, 0xC0];
