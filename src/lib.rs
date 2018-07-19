@@ -243,6 +243,14 @@ where
         Ok(())
     }
 
+    pub fn set_gdo(&mut self, pin: Gdo, cfg: GdoCfg) -> Result<(), Error<E>> {
+        match pin {
+            Gdo::GDO_0 => self.write_register(config::Register::IOCFG0, cfg.value()),
+            Gdo::GDO_1 => self.write_register(config::Register::IOCFG1, cfg.value()),
+            Gdo::GDO_2 => self.write_register(config::Register::IOCFG2, cfg.value()),
+        }
+    }
+
     fn await_machine_state(&mut self, target: MachineState) -> Result<(), Error<E>> {
         use status::*;
         loop {
@@ -361,7 +369,7 @@ where
         Ok(())
     }
 
-    fn write_register(&mut self, reg: config::Register, byte: u8) -> Result<(), Error<E>> {
+    pub fn write_register(&mut self, reg: config::Register, byte: u8) -> Result<(), Error<E>> {
         self.cs.set_low();
 
         let buffer = [reg.addr() | Access::WRITE_SINGLE.offset(), byte];
@@ -386,7 +394,7 @@ where
         Ok(())
     }
 
-    fn modify_register<F>(&mut self, reg: config::Register, f: F) -> Result<(), Error<E>>
+    pub fn modify_register<F>(&mut self, reg: config::Register, f: F) -> Result<(), Error<E>>
     where
         F: FnOnce(u8) -> u8,
     {
@@ -528,10 +536,16 @@ enum MachineState {
     TXFIFO_UNDERFLOW = 0x16,
 }
 
+pub enum Gdo {
+    GDO_0,
+    GDO_1,
+    GDO_2,
+}
+
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy)]
-enum GdoCfg {
+pub enum GdoCfg {
     RX_FIFO_FILLED = 0x00,
     RX_FIFO_FILLED_END_OF_PKT = 0x01,
     TX_FIFO_FILLED = 0x02,
