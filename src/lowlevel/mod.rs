@@ -17,6 +17,7 @@ pub struct Cc1101<SPI, CS> {
     pub(crate) cs: CS,
     //    gdo0: GDO0,
     //    gdo2: GDO2,
+    pub buf: [u8; 64], // 64 byte fixed buffer to allow for transmission of arbitrary slices/arrays
 }
 
 impl<SPI, CS, E> Cc1101<SPI, CS>
@@ -28,6 +29,7 @@ where
         let cc1101 = Cc1101 {
             spi: spi,
             cs: cs,
+            buf: [0u8; 64],
         };
         Ok(cc1101)
     }
